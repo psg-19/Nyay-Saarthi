@@ -1,15 +1,16 @@
+import os
+import json
+import shutil
+
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
-import json
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import OllamaEmbeddings
-import shutil
 import ollama
 
 load_dotenv()
@@ -49,6 +50,21 @@ class ExplainRequest(BaseModel):
     language: str = "hi"
 
 
+def get_message_content(response) -> str:
+    if isinstance(response, dict):
+        return response["message"]["content"].strip()
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        return message.get("content", "").strip()
+    return getattr(message, "content", "").strip()
+
+
+def get_model_name(model) -> str:
+    if isinstance(model, dict):
+        return model.get("model") or model.get("name") or ""
+    return getattr(model, "model", None) or getattr(model, "name", None) or ""
+
+
 def call_ollama_json(prompt: str) -> dict:
     try:
         response = ollama_client.chat(
@@ -57,8 +73,7 @@ def call_ollama_json(prompt: str) -> dict:
             format="json",
             options={"temperature": 0},
         )
-        raw = get_message_content(response)
-        return json.loads(raw)
+        return json.loads(get_message_content(response))
     except Exception as e:
         print(f"Ollama JSON call failed: {e}")
         return {}
@@ -75,21 +90,6 @@ def call_ollama_text(prompt: str) -> str:
     except Exception as e:
         print(f"Ollama text call failed: {e}")
         return "उत्तर देने में त्रुटि हुई। कृपया पुनः प्रयास करें।"
-
-
-def get_message_content(response) -> str:
-    if isinstance(response, dict):
-        return response["message"]["content"].strip()
-    message = getattr(response, "message", None)
-    if isinstance(message, dict):
-        return message.get("content", "").strip()
-    return getattr(message, "content", "").strip()
-
-
-def get_model_name(model) -> str:
-    if isinstance(model, dict):
-        return model.get("model") or model.get("name") or ""
-    return getattr(model, "model", None) or getattr(model, "name", None) or ""
 
 
 def load_document(file_path: str) -> list:
@@ -222,11 +222,9 @@ async def upload_file(file: UploadFile = File(...)):
 
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     texts = text_splitter.split_documents(documents)
-
     document_text = "\n".join([doc.page_content for doc in texts[:20]])
 
     embeddings = OllamaEmbeddings(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
-
     vectorstore = InMemoryVectorStore.from_documents(texts, embeddings)
 
     os.remove(file_location)
@@ -248,10 +246,8 @@ async def ask_question(query: Query):
     if not vectorstore:
         return {"error": "Please upload a document first"}
 
-    # Retrieve relevant chunks from vectorstore
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     docs = retriever.invoke(query.question)
-
     context = "\n\n".join([doc.page_content for doc in docs])
 
     lang_instruction = (
@@ -272,7 +268,6 @@ Question: {query.question}
 Answer:"""
 
     answer = call_ollama_text(prompt)
-
     return {
         "answer": answer,
         "sources": [
@@ -295,8 +290,7 @@ Clause or term to explain:
 "{req.text}"
 
 Plain-language explanation:"""
-    result = call_ollama_text(prompt)
-    return {"explanation": result}
+    return {"explanation": call_ollama_text(prompt)}
 
 
 @app.post("/generate/")
@@ -315,8 +309,7 @@ Use the following details:
 Include all standard clauses required by Indian law, proper signature blocks, witness sections, and clear section headings.
 Generate the complete document:"""
 
-    result = call_ollama_text(prompt)
-    return {"document": result}
+    return {"document": call_ollama_text(prompt)}
 
 
 @app.get("/verify/")
@@ -359,7 +352,7 @@ async def health():
             "ollama_base_url": OLLAMA_BASE_URL,
             "model": OLLAMA_MODEL,
             "embedding_model": OLLAMA_EMBED_MODEL,
-            "available_models": [name for name in (get_model_name(model) for model in models) if name],
+            "available_models": [name for name in (get_model_name(m) for m in models) if name],
         }
     except Exception as e:
         return {
@@ -374,4 +367,6 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+    uvicorn.run(app, host=host, port=port)

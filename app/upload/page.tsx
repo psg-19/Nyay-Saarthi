@@ -1,4 +1,4 @@
-"use client"
+"use client";
 
 import type React from "react"
 import { useState, useCallback } from "react"
@@ -452,6 +452,7 @@ export default function UploadPage() {
           </CardContent>
         </Card>
 
+        {/* Uploaded Files List */}
         {uploadedFiles.length > 0 && (
           <div className="mt-6 space-y-4">
             {uploadedFiles.map((uploadedFile) => (
@@ -519,5 +520,5 @@ export default function UploadPage() {
         )}
       </div>
     </div>
-  )
+  );
 }
