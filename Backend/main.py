@@ -11,30 +11,16 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import os
+import json
 from dotenv import load_dotenv
-
-import nltk
-
-# Langchain and related imports
-from langchain_unstructured import UnstructuredLoader # Use the newer loader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-# from langchain_community.document_loaders import UnstructuredFileLoader
-# --- Loaders based on requirements.txt ---
-from langchain.document_loaders import PyPDFLoader # requires pypdf
-from langchain.document_loaders import PDFMinerLoader # requires pdfminer.six
-# --- Vector Store and Embeddings ---
-from langchain_community.vectorstores import Qdrant
-from langchain_community.embeddings import HuggingFaceEmbeddings
-# --- LLM and Chains ---
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
-from langchain.output_parsers import PydanticOutputParser
-from langchain_core.pydantic_v1 import BaseModel as LangchainBaseModel, Field
-# --- OCR Imports ---
-from pdf2image import convert_from_path # requires pdf2image
-import pytesseract # requires pytesseract
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_ollama import OllamaEmbeddings
+import shutil
+import ollama
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -54,14 +40,13 @@ except Exception as e:
     # Log warning if download fails (might work if already present)
     print(f"NLTK download warning: {e}")
 
-# Logging Configuration
-logger = logging.getLogger("uvicorn.error") # Use uvicorn's logger for consistency
-logging.basicConfig(level=logging.INFO)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+ollama_client = ollama.Client(host=OLLAMA_BASE_URL)
 
-# -------------- FastAPI App Setup --------------
-app = FastAPI(title="Nyay-Saarthi (Hindi Legal QA)")
+app = FastAPI()
 
-# CORS Middleware Configuration (Allow all for development, restrict in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # Be more specific in production, e.g., ["https://yourfrontend.com"]
@@ -70,24 +55,177 @@ app.add_middleware(
     allow_headers=["*"], # Allows all headers
 )
 
-# -------------- Globals --------------
-vectorstore: Optional[Qdrant] = None # Global variable to hold the vector store
-# Initialize embeddings (using a popular sentence transformer model)
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vectorstore = None
+document_text = ""
 
-# --- Initialize text splitter (BEST POSSIBLE CHANGE APPLIED HERE) ---
-# Using smaller chunks and more overlap to potentially isolate facts better
-splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
-logger.info(f"Initialized splitter with chunk_size={splitter._chunk_size} and chunk_overlap={splitter._chunk_overlap}")
-# --- END SPLITTER CHANGE ---
-
-# Stats for monitoring/debugging
-INDEX_STATS = {"files": 0, "chunks": 0}
 
 # -------------- Pydantic Models --------------
 class Query(BaseModel):
     """Request model for asking questions."""
     question: str
+    language: str = "hi"
+
+
+def call_ollama_json(prompt: str) -> dict:
+    try:
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            options={"temperature": 0},
+        )
+        raw = get_message_content(response)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"Ollama JSON call failed: {e}")
+        return {}
+
+
+def call_ollama_text(prompt: str) -> str:
+    try:
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0},
+        )
+        return get_message_content(response)
+    except Exception as e:
+        print(f"Ollama text call failed: {e}")
+        return "उत्तर देने में त्रुटि हुई। कृपया पुनः प्रयास करें।"
+
+
+def get_message_content(response) -> str:
+    if isinstance(response, dict):
+        return response["message"]["content"].strip()
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        return message.get("content", "").strip()
+    return getattr(message, "content", "").strip()
+
+
+def get_model_name(model) -> str:
+    if isinstance(model, dict):
+        return model.get("model") or model.get("name") or ""
+    return getattr(model, "model", None) or getattr(model, "name", None) or ""
+
+
+def load_document(file_path: str) -> list:
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".pdf":
+            return PyPDFLoader(file_path).load()
+        elif ext in (".txt", ".md"):
+            return TextLoader(file_path, encoding="utf-8").load()
+        elif ext == ".docx":
+            import docx
+            doc = docx.Document(file_path)
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return [Document(page_content=text, metadata={"source": file_path})]
+        else:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return [Document(page_content=f.read(), metadata={"source": file_path})]
+    except Exception as e:
+        print(f"Document load error: {e}")
+        return [Document(page_content="", metadata={"source": file_path})]
+
+
+async def analyze_document(text: str) -> dict:
+    prompt = f"""You are an expert legal document analyzer. Analyze the legal document below and return ONLY a valid JSON object — no extra text, no markdown.
+
+Document:
+{text[:3500]}
+
+Return exactly this JSON structure:
+{{
+  "document_type": "Type of legal document (e.g. Rental Agreement, NDA, Service Contract, Employment Agreement, Power of Attorney)",
+  "parties": ["Party 1 name", "Party 2 name"],
+  "key_dates": ["Important date 1 with context", "Important date 2 with context"],
+  "key_clauses": ["Most important obligation or clause 1", "Clause 2", "Clause 3"],
+  "risk_score": 45,
+  "risk_level": "Medium",
+  "risk_factors": ["Specific risky clause or term 1", "Risk 2"],
+  "suggested_questions": [
+    "Question 1 relevant to this document?",
+    "Question 2?",
+    "Question 3?",
+    "Question 4?",
+    "Question 5?"
+  ]
+}}
+
+Rules:
+- risk_score is an integer 0-100 (0-30=Low, 31-60=Medium, 61-100=High)
+- risk_level must be exactly "Low", "Medium", or "High"
+- suggested_questions must be specific to this document type
+- Return ONLY the JSON object"""
+
+    result = call_ollama_json(prompt)
+
+    if not result:
+        return {
+            "document_type": "Legal Document",
+            "parties": ["Party not identified"],
+            "key_dates": ["No specific dates found"],
+            "key_clauses": ["Document processed — ask questions to explore clauses"],
+            "risk_score": 40,
+            "risk_level": "Medium",
+            "risk_factors": ["Manual review recommended"],
+            "suggested_questions": [
+                "मुख्य जोखिम क्या हैं?",
+                "समय सीमा कब तक है?",
+                "भुगतान की शर्तें क्या हैं?",
+                "अनुबंध तोड़ने पर क्या होगा?",
+                "दस्तावेज़ की मुख्य शर्तें क्या हैं?",
+            ],
+        }
+
+    result.setdefault("document_type", "Legal Document")
+    result.setdefault("parties", [])
+    result.setdefault("key_dates", [])
+    result.setdefault("key_clauses", [])
+    result.setdefault("risk_score", 40)
+    result.setdefault("risk_level", "Medium")
+    result.setdefault("risk_factors", [])
+    result.setdefault("suggested_questions", [])
+    return result
+
+
+async def verify_document_text(text: str) -> dict:
+    prompt = f"""You are a legal document verification expert. Analyze this document for issues and return ONLY a valid JSON object.
+
+Document:
+{text[:3500]}
+
+Return exactly this JSON structure:
+{{
+  "missing_signatures": ["Specific finding about missing or incomplete signatures, or empty list if none"],
+  "inconsistent_dates": ["Specific date inconsistency found with details, or empty list if none"],
+  "clause_mismatches": ["Specific problematic or unusual clause with details"],
+  "overall_status": "Valid",
+  "recommendations": ["Actionable recommendation 1", "Recommendation 2", "Recommendation 3"]
+}}
+
+overall_status must be one of: "Valid", "Issues Found", "Needs Review"
+Return ONLY the JSON object."""
+
+    result = call_ollama_json(prompt)
+
+    if not result:
+        return {
+            "missing_signatures": [],
+            "inconsistent_dates": [],
+            "clause_mismatches": [],
+            "overall_status": "Needs Review",
+            "recommendations": ["दस्तावेज़ की मैन्युअल समीक्षा करें।"],
+        }
+
+    result.setdefault("missing_signatures", [])
+    result.setdefault("inconsistent_dates", [])
+    result.setdefault("clause_mismatches", [])
+    result.setdefault("overall_status", "Needs Review")
+    result.setdefault("recommendations", [])
+    return result
+
 
 # --- Clause Library and Pydantic Models for Clause Identification ---
 CLAUSE_LIBRARY = {
@@ -367,102 +505,35 @@ def stats():
 # --- MODIFIED /upload/ Endpoint ---
 @app.post("/upload/", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)):
-    """
-    Uploads, extracts, identifies clauses, splits, and indexes a document.
-    Returns identified clauses along with success message.
-    Resets the vector store for each new upload (single-document context).
-    """
-    global vectorstore, splitter # Ensure splitter is accessible
-    original_filename = safe_filename(file.filename)
-    tmp_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_{original_filename}")
-    logger.info(f"Processing upload: {original_filename}")
+    global vectorstore, document_text
 
-    # --- Save file ---
-    try:
-        async with aiofiles.open(tmp_path, "wb") as out_file:
-            while True:
-                chunk = await file.read(CHUNK_SIZE)
-                if not chunk: break
-                await out_file.write(chunk)
-        await file.close()
-        logger.info(f"File saved temporarily to: {tmp_path}")
-    except Exception as e:
-        logger.exception(f"Failed to save uploaded file '{original_filename}'")
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    file_location = f"temp_{file.filename}"
+    with open(file_location, "wb+") as file_object:
+        shutil.copyfileobj(file.file, file_object)
 
-    extracted_docs = []
-    chunks = []
-    identified_clauses = []
-    try:
-        # --- Extract text ---
-        extracted_docs = await _extract_docs(tmp_path, original_filename)
+    documents = load_document(file_location)
 
-        # --- Identify Clauses ---
-        if extracted_docs:
-            logger.info("Starting clause identification...")
-            identified_clauses = await identify_clauses_llm(extracted_docs)
-            logger.info(f"Finished clause identification. Found {len(identified_clauses)} clauses.")
-        else:
-             logger.warning("No documents extracted, skipping clause identification.")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    texts = text_splitter.split_documents(documents)
 
-        # --- Split documents into chunks ---
-        if extracted_docs:
-            chunks = splitter.split_documents(extracted_docs)
-            logger.info(f"Split '{original_filename}' into {len(chunks)} chunks using size={splitter._chunk_size}, overlap={splitter._chunk_overlap}.")
-        else:
-            chunks = []
+    document_text = "\n".join([doc.page_content for doc in texts[:20]])
 
-    except HTTPException as http_exc:
-         if os.path.exists(tmp_path): os.remove(tmp_path)
-         raise http_exc
-    except Exception as e:
-        logger.exception(f"Failed to extract, identify clauses, or split document '{original_filename}'")
-        raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
-    finally:
-        # --- Clean up temporary file ---
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-                logger.info(f"Removed temporary file: {tmp_path}")
-        except Exception as e:
-            logger.warning(f"Could not remove temp file {tmp_path}: {e}")
+    embeddings = OllamaEmbeddings(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
-    if not chunks:
-         logger.warning(f"No chunks generated for {original_filename} after processing.")
-         return UploadResponse(
-             message=f"File processed. No indexable content found, but clauses identified.",
-             chunks_added=0,
-             identified_clauses=identified_clauses
-            )
+    vectorstore = InMemoryVectorStore.from_documents(texts, embeddings)
 
-    # --- Index chunks ---
-    try:
-        # --- QDRANT RESET LOGIC ---
-        # Clear existing store to ensure context is only from the latest upload
-        logger.warning("Clearing existing in-memory vector store before indexing new document.")
-        vectorstore = None # Reset the global variable
-        INDEX_STATS["files"] = 0 # Reset stats
-        INDEX_STATS["chunks"] = 0
-        # --- END RESET LOGIC ---
+    os.remove(file_location)
 
-        logger.info("Initializing in-memory Qdrant vector store with new document...")
-        vectorstore = Qdrant.from_documents(chunks, embeddings, location=":memory:", collection_name="legal_docs")
+    analysis = await analyze_document(document_text)
+    verification = await verify_document_text(document_text)
 
-        INDEX_STATS["files"] = 1 # Set to 1 for the new document
-        INDEX_STATS["chunks"] = len(chunks)
-        logger.info(f"Successfully indexed {len(chunks)} chunks. Total chunks: {INDEX_STATS['chunks']}")
+    return {
+        "message": "File uploaded and processed successfully",
+        "filename": file.filename,
+        "analysis": analysis,
+        "verification": verification,
+    }
 
-    except Exception as e:
-        logger.exception("Failed to index chunks into Qdrant")
-        raise HTTPException(status_code=500, detail=f"Failed to index document chunks: {e}")
-
-    # --- Return success response including clauses ---
-    return UploadResponse(
-        message="File uploaded, processed, and indexed successfully",
-        chunks_added=len(chunks),
-        identified_clauses=identified_clauses
-    )
-# --- END MODIFIED /upload/ Endpoint ---
 
 @app.post("/ask/")
 async def ask_question(query: Query):
@@ -472,155 +543,96 @@ async def ask_question(query: Query):
     Applies accuracy improvements (retriever k=6, refined prompt).
     """
     global vectorstore
-    if vectorstore is None:
-        logger.warning("Attempted /ask before uploading documents.")
-        raise HTTPException(status_code=400, detail="Please upload and process a document first via the /upload endpoint.")
+    if not vectorstore:
+        return {"error": "Please upload a document first"}
 
-    # Define the refined prompt template for Hindi QA
-    prompt_template = """
-    दिए गए संदर्भ का उपयोग करके निम्नलिखित प्रश्न का उत्तर सरल हिंदी में दें।
-    यदि उत्तर ज्ञात न हो, तो स्पष्ट रूप से कहें कि पर्याप्त जानकारी उपलब्ध नहीं है, उत्तर बनाने का प्रयास न करें।
-    उत्तर बिंदुवार (bullet points) और संक्षेप में दें।
-    **यदि प्रश्न किसी सूची या विशिष्ट संख्या में आइटम के लिए पूछता है (उदाहरण के लिए, "दो कारण बताएं"), तो सुनिश्चित करें कि आप उन सभी आइटम को निकालने और सूचीबद्ध करने का प्रयास करें जो संदर्भ में दिए गए हैं।**
+    # Retrieve relevant chunks from vectorstore
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    docs = retriever.invoke(query.question)
 
-    संदर्भ:
-    {context}
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    प्रश्न:
-    {question}
+    lang_instruction = (
+        "Answer in simple Hindi. Use Devanagari script."
+        if query.language == "hi"
+        else "Answer in simple English."
+    )
+    prompt = f"""You are a helpful legal assistant. Use the context below to answer the question.
+{lang_instruction}
+If you don't know the answer from the context, say so — don't make things up.
+Use **bold** for important terms and - for bullet points where appropriate.
 
-    उत्तर (सरल हिंदी में):
-    """
+Context:
+{context}
 
-    PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain_kwargs = {"prompt": PROMPT}
+Question: {query.question}
 
-    # Initialize the QA chain
-    try:
-        # --- ACCURACY IMPROVEMENT: Increased retriever results ---
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 10}) # Fetch top 6 chunks
-        # --- END ACCURACY IMPROVEMENT ---
+Answer:"""
 
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=ChatGoogleGenerativeAI(
-                model="gemini-flash-latest",
-                temperature=0.2, # Keep temperature low for factuality
-                google_api_key=os.getenv("GOOGLE_API_KEY"),
-            ),
-            chain_type="stuff", # Assumes combined chunks fit context window
-            retriever=retriever, # Use the modified retriever
-            return_source_documents=True,
-            chain_type_kwargs=chain_kwargs,
-        )
-    except Exception as e:
-         logger.exception("Failed to initialize QA chain")
-         raise HTTPException(status_code=500, detail=f"Could not initialize QA system: {e}")
+    answer = call_ollama_text(prompt)
 
-    # Invoke the QA chain
-    try:
-        logger.info(f"Invoking QA chain with question: {query.question}")
-        result: Dict[str, Any] = await qa_chain.ainvoke({"query": query.question})
-    except Exception as e:
-        logger.exception("Error during QA chain invocation")
-        raise HTTPException(status_code=500, detail=f"Error processing question: {e}")
-
-    # Process source documents
-    sources = []
-    if "source_documents" in result:
-        for doc in result["source_documents"]:
-            content = _clean_text(getattr(doc, "page_content", "") or "")
-            if content:
-                page = 1
-                if hasattr(doc, 'metadata') and doc.metadata:
-                    page = doc.metadata.get("page_number", 1)
-                sources.append({"content": content, "page": page})
-
-    final_answer = result.get("result", "क्षमा करें, मुझे उत्तर नहीं मिल सका।")
-    logger.info(f"QA chain result: Answer length={len(final_answer)}, Sources found={len(sources)}")
-
-    return {"answer": final_answer, "sources": sources}
-
-
-# --- COMPARE ENDPOINT ---
-@app.post("/compare/")
-async def compare_documents(file1: UploadFile = File(...), file2: UploadFile = File(...)):
-    """Compares the text content of two uploaded documents using robust extraction."""
-    original1 = safe_filename(file1.filename)
-    tmp_path1 = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cmp1_{original1}")
-    original2 = safe_filename(file2.filename)
-    tmp_path2 = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cmp2_{original2}")
-    text1, text2 = "", ""
-    diff_lines = []
-    try:
-        # Save files
-        logger.info(f"Saving file1 ('{original1}') to {tmp_path1}")
-        async with aiofiles.open(tmp_path1, "wb") as out:
-            while True:
-                chunk = await file1.read(CHUNK_SIZE)
-                if not chunk: break
-                await out.write(chunk)
-        await file1.close()
-        logger.info(f"Saving file2 ('{original2}') to {tmp_path2}")
-        async with aiofiles.open(tmp_path2, "wb") as out:
-            while True:
-                chunk = await file2.read(CHUNK_SIZE)
-                if not chunk: break
-                await out.write(chunk)
-        await file2.close()
-
-        # Extract text
-        logger.info(f"Extracting text from {original1}...")
-        docs1 = await _extract_docs(tmp_path1, original1)
-        logger.info(f"Extracting text from {original2}...")
-        docs2 = await _extract_docs(tmp_path2, original2)
-
-        text1 = "\n".join([doc.page_content for doc in docs1])
-        text2 = "\n".join([doc.page_content for doc in docs2])
-        logger.info(f"Text lengths - File1: {len(text1)}, File2: {len(text2)}")
-
-        # Perform comparison
-        logger.info("Performing comparison using difflib...")
-        diff_lines = list(difflib.unified_diff(
-            text1.splitlines(keepends=True),
-            text2.splitlines(keepends=True),
-            fromfile=original1,
-            tofile=original2,
-            n=3
-        ))
-        logger.info(f"Comparison complete. Found {len(diff_lines)} difference lines.")
-
-    except HTTPException as http_exc:
-        logger.error(f"HTTPException during extraction: {http_exc.detail}")
-        raise http_exc
-    except Exception as e:
-        logger.exception("Error during file saving, text extraction, or comparison in /compare")
-        raise HTTPException(status_code=500, detail=f"Server error during comparison processing: {type(e).__name__}")
-    finally:
-        # Clean up temporary files
-        for p in [tmp_path1, tmp_path2]:
-             try:
-                 if p and os.path.exists(p):
-                      os.remove(p)
-                      logger.info(f"Removed temporary comparison file: {p}")
-             except Exception as e:
-                 logger.warning(f"Could not remove temp file {p}: {e}")
-
-    return {"comparison_lines": diff_lines}
-
-
-# --- Dummy /verify Endpoint ---
-@app.get("/verify/")
-def verify_document():
-    """Dummy endpoint for verification report."""
     return {
-        "report": {
-            "missing_signatures": ["Signature not found for Jane Doe"],
-            "inconsistent_dates": ["The end date is before the start date."],
-            "clause_mismatches": ["Liability clause weaker than standard template."],
-        }
+        "answer": answer,
+        "sources": [
+            {"content": doc.page_content, "page": doc.metadata.get("page_number", 1)}
+            for doc in docs
+        ],
     }
 
-# --- Main execution block ---
+
+@app.get("/verify/")
+async def verify_document():
+    global vectorstore, document_text
+
+    if not vectorstore or not document_text:
+        return {
+            "report": {
+                "missing_signatures": ["कोई दस्तावेज़ अपलोड नहीं है।"],
+                "inconsistent_dates": [],
+                "clause_mismatches": [],
+                "overall_status": "No Document",
+                "recommendations": ["दस्तावेज़ अपलोड करके पुनः प्रयास करें।"],
+            }
+        }
+
+    return {"report": await verify_document_text(document_text)}
+
+
+@app.get("/")
+async def root():
+    return {
+        "status": "Nyay-Saarthi backend running",
+        "llm_provider": "ollama",
+        "ollama_base_url": OLLAMA_BASE_URL,
+        "model": OLLAMA_MODEL,
+        "embedding_model": OLLAMA_EMBED_MODEL,
+    }
+
+
+@app.get("/health/")
+async def health():
+    try:
+        response = ollama_client.list()
+        models = response.get("models", []) if isinstance(response, dict) else getattr(response, "models", [])
+        return {
+            "status": "ok",
+            "llm_provider": "ollama",
+            "ollama_base_url": OLLAMA_BASE_URL,
+            "model": OLLAMA_MODEL,
+            "embedding_model": OLLAMA_EMBED_MODEL,
+            "available_models": [name for name in (get_model_name(model) for model in models) if name],
+        }
+    except Exception as e:
+        return {
+            "status": "ollama_unavailable",
+            "llm_provider": "ollama",
+            "ollama_base_url": OLLAMA_BASE_URL,
+            "model": OLLAMA_MODEL,
+            "embedding_model": OLLAMA_EMBED_MODEL,
+            "error": str(e),
+        }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))

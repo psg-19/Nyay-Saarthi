@@ -1,16 +1,13 @@
-// app/layout.tsx
-import type React from "react";
-import type { Metadata } from "next";
-import { GeistSans } from "geist/font/sans";
-import { GeistMono } from "geist/font/mono";
-import { Analytics } from "@vercel/analytics/next";
-import { Suspense } from "react";
-import { Header } from "@/components/header";
-// import { Footer } from "@/components/footer";
-import "./globals.css";
-import { CustomCursor } from "@/components/CustomCursor";
-import { Toaster } from "@/components/ui/sonner";
-import { ActivityTimeoutHandler } from "@/components/ActivityTimeoutHandler"; // Import the handler
+import type React from "react"
+import type { Metadata } from "next"
+import { GeistSans } from "geist/font/sans"
+import { GeistMono } from "geist/font/mono"
+import { Analytics } from "@vercel/analytics/next"
+import { Suspense } from "react"
+import { Header } from "@/components/header"
+import { ThemeProvider } from "@/components/theme-provider"
+import { LanguageProvider } from "@/lib/language-context"
+import "./globals.css"
 
 export const metadata: Metadata = {
   title: "न्याय-सारथी | Nyay-Saarthi",
@@ -24,21 +21,22 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="hi">
-      <head>
-        <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-      </head>
+    <html lang="hi" suppressHydrationWarning>
       <body className={`font-sans ${GeistSans.variable} ${GeistMono.variable}`}>
-        <CustomCursor />
-        <Header />
-        <main className="pt-20">
-          <ActivityTimeoutHandler>
-             <Suspense fallback={null}>{children}</Suspense>
-          </ActivityTimeoutHandler>
-        </main>
-        {/* <Footer /> */}
-        <Analytics />
-        <Toaster richColors position="top-right" />
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="light"
+          enableSystem={false}
+          disableTransitionOnChange
+        >
+          <LanguageProvider>
+            <Header />
+            <main className="pt-20">
+              <Suspense fallback={null}>{children}</Suspense>
+            </main>
+            <Analytics />
+          </LanguageProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

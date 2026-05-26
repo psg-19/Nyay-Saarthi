@@ -1,74 +1,57 @@
-// app/login/page.tsx
-"use client";
+"use client"
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
-import { createClient } from "@/utils/supabase/client";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-// Remove Label import from ui/label
-import { Checkbox } from "@/components/ui/checkbox";
-import { Eye, EyeOff, Mail, Lock, ArrowRight, Shield, Users, FileText, Loader2 } from "lucide-react";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel, // Use hook-form's Label
-  FormMessage,
-} from "@/components/ui/form"; // Import hook-form components
-
-// --- Zod Schema for Validation ---
-const loginSchema = z.object({
-  email: z.string().email({ message: "कृपया वैध ईमेल पता दर्ज करें।" }),
-  password: z.string().min(1, { message: "कृपया पासवर्ड दर्ज करें।" }), // Changed min to 1 for presence check
-  rememberMe: z.boolean().optional(),
-});
-
-type LoginFormValues = z.infer<typeof loginSchema>;
-// --- End Schema ---
+import { useState } from "react"
+import { useRouter } from "next/navigation"
+import Link from "next/link"
+import { createClient } from "@/utils/supabase/client"
+import { createLocalSession } from "@/lib/local-auth"
+import { isSupabaseConfigured } from "@/lib/supabase-config"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Eye, EyeOff, Mail, Lock, ArrowRight, Shield, Users, FileText } from "lucide-react"
 
 export default function LoginPage() {
-  const [showPassword, setShowPassword] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [serverError, setServerError] = useState("");
-  const router = useRouter();
-  const supabase = createClient();
+  // --- WORKING LOGIN LOGIC ---
+  const [showPassword, setShowPassword] = useState(false)
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [rememberMe, setRememberMe] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState("")
+  const router = useRouter()
 
-  // --- React Hook Form Setup ---
-  const form = useForm<LoginFormValues>({
-    resolver: zodResolver(loginSchema),
-    defaultValues: {
-      email: "",
-      password: "",
-      rememberMe: false,
-    },
-    mode: "onChange", // Validate on change
-  });
-  // --- End Setup ---
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setIsLoading(true)
+    setError("")
 
-  // --- Updated Login Handler ---
-  const handleLogin = async (values: LoginFormValues) => {
-    setIsLoading(true);
-    setServerError("");
+    if (!isSupabaseConfigured()) {
+      createLocalSession(email)
+      router.push("/dashboard")
+      router.refresh()
+      return
+    }
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email: values.email,
-      password: values.password,
-    });
+    try {
+      const supabase = createClient()
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      })
 
-    setIsLoading(false);
-
-    if (error) {
-      setServerError(error.message || "लॉगिन विफल। कृपया अपनी जानकारी जांचें।");
-    } else {
-      router.push("/dashboard");
-      router.refresh();
+      if (error) {
+        setError(error.message || "Failed to log in. Please check your credentials.")
+        setIsLoading(false)
+      } else {
+        router.push("/dashboard")
+        router.refresh()
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to log in. Please try again.")
+      setIsLoading(false)
     }
   };
   // --- End Handler ---
@@ -263,5 +246,5 @@ export default function LoginPage() {
          </div>
       </div>
     </div>
-  );
+  )
 }

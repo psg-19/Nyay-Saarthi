@@ -1,109 +1,66 @@
-// app/register/page.tsx
-"use client";
+"use client"
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Eye, EyeOff, Mail, Lock, ArrowRight, Shield, Users, FileText, Loader2, User as UserIcon, Phone } from "lucide-react"; // Added UserIcon, Phone
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
-import { singUp as signUp } from "@/actions/auth"; // Import the server action
-import { toast } from "sonner"; // For showing success/error messages
-
-// --- Zod Schema for Registration Validation ---
-const registerSchema = z.object({
-  name: z.string().min(1, { message: "कृपया पूरा नाम दर्ज करें।" }),
-  email: z.string().email({ message: "कृपया वैध ईमेल पता दर्ज करें।" }),
-  phone: z.string().min(10, { message: "कृपया वैध 10 अंकों का फ़ोन नंबर दर्ज करें।" }).max(15, { message: "फ़ोन नंबर बहुत लंबा है।"}), // Basic phone validation
-  password: z.string().min(6, { message: "पासवर्ड कम से कम 6 अक्षर का होना चाहिए।" }),
-  confirmPassword: z.string().min(1, { message: "कृपया पासवर्ड की पुष्टि करें।" }),
-  terms: z.boolean().refine(val => val === true, {
-    message: "आपको नियमों और शर्तों से सहमत होना होगा।",
-  }),
-}).refine(data => data.password === data.confirmPassword, {
-  message: "पासवर्ड मेल नहीं खाते।",
-  path: ["confirmPassword"], // Apply error to confirmPassword field
-});
-
-type RegisterFormValues = z.infer<typeof registerSchema>;
-// --- End Schema ---
+import { useState } from "react"
+import { useRouter } from "next/navigation"
+import Link from "next/link"
+import { createClient } from "@/utils/supabase/client"
+import { createLocalSession } from "@/lib/local-auth"
+import { getSupabaseConfigError, isSupabaseConfigured } from "@/lib/supabase-config"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Eye, EyeOff, Mail, Lock, User, Phone, ArrowRight, CheckCircle } from "lucide-react"
 
 export default function RegisterPage() {
-  const [showPassword, setShowPassword] = useState(false);
-  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [serverError, setServerError] = useState("");
-  const router = useRouter();
+  // --- WORKING REGISTER LOGIC ---
+  const [showPassword, setShowPassword] = useState(false)
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false)
+  
+  // Using individual state for clarity with Supabase auth
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
+  const [agreeToTerms, setAgreeToTerms] = useState(false)
+  
+  const [error, setError] = useState("")
+  const [message, setMessage] = useState("")
+  
+  const router = useRouter()
 
-  // --- React Hook Form Setup ---
-  const form = useForm<RegisterFormValues>({
-    resolver: zodResolver(registerSchema),
-    defaultValues: {
-      name: "",
-      email: "",
-      phone: "",
-      password: "",
-      confirmPassword: "",
-      terms: false,
-    },
-    mode: "onChange",
-  });
-  // --- End Setup ---
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError("")
+    setMessage("")
+    
+    if (password !== confirmPassword) {
+      setError("Passwords do not match.")
+      return
+    }
 
-  // --- Registration Handler ---
-  const handleRegister = async (values: RegisterFormValues) => {
-    setIsLoading(true);
-    setServerError("");
-    console.log("Register button clicked"); // Debug log
+    if (!isSupabaseConfigured()) {
+      createLocalSession(email)
+      setMessage(`${getSupabaseConfigError()} Local account created.`)
+      setTimeout(() => router.push("/dashboard"), 800)
+      return
+    }
 
-    // Create FormData for the server action
-    const formData = new FormData();
-    formData.append("name", values.name);
-    formData.append("email", values.email);
-    formData.append("phone", values.phone);
-    formData.append("password", values.password);
-
-    console.log("Calling signUp server action..."); // Debug log
     try {
-        const result = await signUp(formData); // Call the server action
-        console.log("Result from signUp:", result); // Debug log
+      const supabase = createClient()
+      const { error } = await supabase.auth.signUp({
+        email,
+        password,
+      })
 
-        if (result?.status === 'error') {
-            setServerError(result.message || "पंजीकरण विफल। कृपया पुनः प्रयास करें।");
-            toast.error("Registration Failed", { description: result.message });
-        } else if (result?.status === 'pending') {
-            // This status indicates user exists but needs verification - show appropriate message
-             setServerError(result.message || "यह ईमेल पहले से मौजूद है। कृपया सत्यापित करें या लॉगिन करें।");
-             toast.info("Account Exists", { description: "This email already exists. Please verify or log in." });
-             // Optionally redirect to login or verification pending page
-             // router.push('/login');
-        } else if (result?.status === 'success') {
-            toast.success("Registration Successful!", { description: "Please check your email to verify your account." });
-            router.push("/Verify"); // Redirect to verification notice page
-        } else {
-             // Handle unexpected result format
-             setServerError("An unexpected error occurred during registration.");
-             toast.error("Registration Failed", { description: "Unexpected response from server." });
-        }
-    } catch (err: any) {
-        console.error("Error calling signUp action:", err);
-        setServerError("पंजीकरण के दौरान एक त्रुटि हुई।");
-        toast.error("Registration Failed", { description: err.message || "An unknown error occurred." });
-    } finally {
-        setIsLoading(false);
+      if (error) {
+        setError(error.message)
+      } else {
+        setMessage("Registration successful! You can now log in.")
+        setTimeout(() => router.push("/login"), 2000)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to sign up. Please try again.")
     }
   };
   // --- End Handler ---
@@ -291,5 +248,5 @@ export default function RegisterPage() {
         </div>
       </div>
     </div>
-  );
+  )
 }
