@@ -7,11 +7,12 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import {
   Send, Bot, User, FileText, AlertTriangle, Lightbulb,
-  Copy, CheckCheck, Shield, Calendar, Users, ChevronDown, ChevronUp, Trash2,
+  Copy, CheckCheck, Shield, Calendar, Users, ChevronDown, ChevronUp, Trash2, SwitchCamera,
 } from "lucide-react"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { apiUrl } from "@/lib/api"
 import { useLanguage } from "@/lib/language-context"
+import { getDocuments, isSupabaseUser } from "@/lib/supabase-documents"
 
 interface Message {
   id: number
@@ -97,6 +98,8 @@ function getChatKey(docName: string) {
   return `nyay_chat_${docName.replace(/[^a-zA-Z0-9]/g, "_")}`
 }
 
+interface StoredDoc { id: string; name: string; analysis: DocumentAnalysis; uploadedAt: string }
+
 export default function ChatPage() {
   const { t, lang } = useLanguage()
 
@@ -106,43 +109,65 @@ export default function ChatPage() {
   const [analysis, setAnalysis] = useState<DocumentAnalysis | null>(null)
   const [documentName, setDocumentName] = useState<string>("")
   const [showSources, setShowSources] = useState<Record<number, boolean>>({})
+  const [allDocs, setAllDocs] = useState<StoredDoc[]>([])
+  const [showDocPicker, setShowDocPicker] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  // track whether we've finished the initial load so the save effect doesn't overwrite before load
   const loadedRef = useRef(false)
 
   useEffect(() => {
-    const stored = localStorage.getItem("nyay_document_analysis")
-    const name = localStorage.getItem("nyay_document_name")
-    if (stored) { try { setAnalysis(JSON.parse(stored)) } catch {} }
-
-    const docName = name ?? ""
-    setDocumentName(docName)
-
-    // Load chat history for this specific document
-    if (docName) {
-      const raw = localStorage.getItem(getChatKey(docName))
-      if (raw) {
-        try {
-          const parsed: Message[] = JSON.parse(raw).map((m: Message & { timestamp: string }) => ({
-            ...m,
-            timestamp: new Date(m.timestamp),
-          }))
-          setMessages(parsed.length ? parsed : [WELCOME_MSG])
-        } catch {
-          setMessages([WELCOME_MSG])
-        }
-      } else {
-        setMessages([WELCOME_MSG])
+    async function init() {
+      // Load all docs for the picker
+      let docs: StoredDoc[] = []
+      const sbUser = await isSupabaseUser()
+      if (sbUser) {
+        const sbDocs = await getDocuments()
+        docs = sbDocs.map((d) => ({ id: d.id, name: d.name, analysis: d.analysis, uploadedAt: d.uploaded_at }))
       }
-    } else {
-      setMessages([WELCOME_MSG])
+      if (!docs.length) {
+        try { const raw = localStorage.getItem("nyay_documents"); if (raw) docs = JSON.parse(raw) } catch {}
+      }
+      setAllDocs(docs)
+
+      const stored = localStorage.getItem("nyay_document_analysis")
+      const name = localStorage.getItem("nyay_document_name")
+      if (stored) { try { setAnalysis(JSON.parse(stored)) } catch {} }
+
+      const docName = name ?? ""
+      setDocumentName(docName)
+
+      if (docName) {
+        const raw = localStorage.getItem(getChatKey(docName))
+        if (raw) {
+          try {
+            const parsed: Message[] = JSON.parse(raw).map((m: Message & { timestamp: string }) => ({
+              ...m, timestamp: new Date(m.timestamp),
+            }))
+            setMessages(parsed.length ? parsed : [WELCOME_MSG])
+          } catch { setMessages([WELCOME_MSG]) }
+        } else { setMessages([WELCOME_MSG]) }
+      } else { setMessages([WELCOME_MSG]) }
+
+      loadedRef.current = true
+      const pending = localStorage.getItem("nyay_pending_question")
+      if (pending) { setInputMessage(pending); localStorage.removeItem("nyay_pending_question") }
     }
-
-    loadedRef.current = true
-
-    const pending = localStorage.getItem("nyay_pending_question")
-    if (pending) { setInputMessage(pending); localStorage.removeItem("nyay_pending_question") }
+    init()
   }, [])
+
+  const switchDocument = (doc: StoredDoc) => {
+    localStorage.setItem("nyay_document_analysis", JSON.stringify(doc.analysis))
+    localStorage.setItem("nyay_document_name", doc.name)
+    setAnalysis(doc.analysis)
+    setDocumentName(doc.name)
+    setShowDocPicker(false)
+    const raw = localStorage.getItem(getChatKey(doc.name))
+    if (raw) {
+      try {
+        const parsed: Message[] = JSON.parse(raw).map((m: Message & { timestamp: string }) => ({ ...m, timestamp: new Date(m.timestamp) }))
+        setMessages(parsed.length ? parsed : [WELCOME_MSG])
+      } catch { setMessages([WELCOME_MSG]) }
+    } else { setMessages([WELCOME_MSG]) }
+  }
 
   // Persist chat history to localStorage on every change, keyed by document name
   useEffect(() => {
@@ -209,32 +234,58 @@ export default function ChatPage() {
         <div className="flex-1 flex flex-col min-w-0">
           {/* Header */}
           <div className="bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 px-6 py-4 shrink-0">
-            <div className="flex items-center justify-between">
-              <div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
                 <h1 className="text-xl font-bold text-gray-900 dark:text-white">
                   {lang === 'hi' ? 'AI कानूनी सहायक' : 'AI Legal Assistant'}
                 </h1>
-                <p className="text-sm text-gray-500 dark:text-gray-400">
+                <p className="text-sm text-gray-500 dark:text-gray-400 truncate">
                   {documentName ? `📄 ${documentName}` : (lang === 'hi' ? 'दस्तावेज़ अपलोड करें और प्रश्न पूछें' : 'Upload a document and ask questions')}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
                 {analysis && <RiskBadge level={analysis.risk_level} score={analysis.risk_score} />}
                 <Badge variant="secondary" className="bg-green-100 dark:bg-green-900/40 text-green-800 dark:text-green-300">
-                  <Bot className="h-3 w-3 mr-1" />
-                  {lang === 'hi' ? 'ऑनलाइन' : 'Online'}
+                  <Bot className="h-3 w-3 mr-1" />{lang === 'hi' ? 'ऑनलाइन' : 'Online'}
                 </Badge>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={clearChat}
+                {allDocs.length > 1 && (
+                  <Button variant="outline" size="sm" onClick={() => setShowDocPicker((v) => !v)}
+                    className="border-blue-400 text-blue-600 dark:border-blue-700 dark:text-blue-400 text-xs gap-1">
+                    <SwitchCamera className="h-3.5 w-3.5" />
+                    {lang === 'hi' ? 'बदलें' : 'Switch'}
+                  </Button>
+                )}
+                <Button variant="ghost" size="sm" onClick={clearChat}
                   title={lang === 'hi' ? 'चैट साफ़ करें' : 'Clear chat'}
-                  className="text-gray-400 hover:text-red-500 dark:hover:text-red-400"
-                >
+                  className="text-gray-400 hover:text-red-500 dark:hover:text-red-400">
                   <Trash2 className="h-4 w-4" />
                 </Button>
               </div>
             </div>
+
+            {/* Document picker dropdown */}
+            {showDocPicker && (
+              <div className="mt-3 border border-gray-200 dark:border-gray-700 rounded-xl bg-gray-50 dark:bg-gray-800 p-3 space-y-2 max-h-52 overflow-y-auto">
+                <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1">
+                  {lang === 'hi' ? 'किस दस्तावेज़ से बात करें?' : 'Which document to chat with?'}
+                </p>
+                {allDocs.map((doc) => (
+                  <button key={doc.id} onClick={() => switchDocument(doc)}
+                    className={`w-full text-left flex items-center gap-3 px-3 py-2 rounded-lg border transition-all ${
+                      doc.name === documentName
+                        ? "border-green-500 bg-green-50 dark:bg-green-900/20 dark:border-green-700"
+                        : "border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 hover:border-green-300 dark:hover:border-green-700"
+                    }`}>
+                    <FileText className="w-4 h-4 text-green-600 dark:text-green-400 shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-gray-800 dark:text-white truncate">{doc.name}</p>
+                      <p className="text-xs text-gray-400 dark:text-gray-500">{doc.analysis.document_type} · Risk {doc.analysis.risk_score}/100</p>
+                    </div>
+                    {doc.name === documentName && <CheckCheck className="w-4 h-4 text-green-500 shrink-0" />}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Messages */}

@@ -35,6 +35,8 @@ Nyay-Saarthi/.env*.local
 Backend/__pycache__/
 Backend/venv/
 Backend/.venv/
+venv/
+.venv/
 Backend/temp_*
 Backend/.env
 
