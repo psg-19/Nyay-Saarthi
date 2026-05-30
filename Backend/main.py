@@ -50,6 +50,22 @@ class ExplainRequest(BaseModel):
     language: str = "hi"
 
 
+class CustomDocRequest(BaseModel):
+    description: str
+    parties: str = ""
+    key_terms: str = ""
+    jurisdiction: str = "India"
+    language: str = "hi"
+
+
+class CompareRequest(BaseModel):
+    doc_a_name: str
+    doc_a_analysis: dict
+    doc_b_name: str
+    doc_b_analysis: dict
+    language: str = "hi"
+
+
 def get_message_content(response) -> str:
     if isinstance(response, dict):
         return response["message"]["content"].strip()
@@ -306,10 +322,87 @@ async def generate_template(req: TemplateRequest):
 Use the following details:
 {fields_text}
 
-Include all standard clauses required by Indian law, proper signature blocks, witness sections, and clear section headings.
-Generate the complete document:"""
+Formatting rules (strictly follow):
+- Use # for the document title (e.g., # RENTAL AGREEMENT)
+- Use ## for major section headings (e.g., ## 1. PARTIES, ## 2. TERMS)
+- Use ### for sub-sections
+- Use numbered lists (1. 2. 3.) for clauses
+- Use **bold** only for party names, dates, and key amounts
+- End with a ## SIGNATURES section with blank lines for signing
+- Do NOT write "Here is the document" or any preamble — start directly with the title
+
+Generate the complete legal document:"""
 
     return {"document": call_ollama_text(prompt)}
+
+
+@app.post("/generate-custom/")
+async def generate_custom_document(req: CustomDocRequest):
+    lang_instruction = (
+        "in Hindi using Devanagari script. Make it formal and legally appropriate for India."
+        if req.language == "hi"
+        else "in English. Make it formal and legally appropriate for India."
+    )
+    parts = [f"Document description: {req.description}"]
+    if req.parties.strip():
+        parts.append(f"Parties involved: {req.parties}")
+    if req.key_terms.strip():
+        parts.append(f"Key terms and requirements: {req.key_terms}")
+    if req.jurisdiction.strip():
+        parts.append(f"Jurisdiction: {req.jurisdiction}")
+    details = "\n".join(f"- {p}" for p in parts)
+
+    prompt = f"""You are an expert Indian legal document drafter. Based on the user's description below, generate a complete, professional legal document {lang_instruction}.
+
+User requirements:
+{details}
+
+Formatting rules (strictly follow):
+- Use # for the document title in ALL CAPS (e.g., # LOAN AGREEMENT)
+- Use ## for major sections (e.g., ## 1. PARTIES INVOLVED, ## 2. TERMS AND CONDITIONS)
+- Use ### for sub-sections
+- Use numbered lists for clauses within sections
+- Use **bold** only for names, key dates, and monetary amounts
+- Include ## RECITALS, ## DEFINITIONS, ## OBLIGATIONS, ## TERMINATION, ## DISPUTE RESOLUTION, ## GOVERNING LAW, ## SIGNATURES sections
+- End with a ## SIGNATURES section with blank signature lines
+- Do NOT write any preamble — start directly with the # title
+
+Generate the complete legal document now:"""
+
+    result = call_ollama_text(prompt)
+    return {"document": result, "detected_type": req.description[:80]}
+
+
+@app.post("/ai-compare/")
+async def ai_compare(req: CompareRequest):
+    lang_instruction = "Respond in simple Hindi using Devanagari script." if req.language == "hi" else "Respond in simple English."
+    a = req.doc_a_analysis
+    b = req.doc_b_analysis
+
+    prompt = f"""You are a legal document expert. Compare these two documents and give a clear recommendation.
+{lang_instruction}
+
+Document A: {req.doc_a_name}
+- Type: {a.get('document_type', 'Unknown')}
+- Risk Score: {a.get('risk_score', 0)}/100 ({a.get('risk_level', 'Unknown')})
+- Risk Factors: {', '.join(a.get('risk_factors', [])[:3])}
+- Key Clauses: {', '.join(a.get('key_clauses', [])[:3])}
+
+Document B: {req.doc_b_name}
+- Type: {b.get('document_type', 'Unknown')}
+- Risk Score: {b.get('risk_score', 0)}/100 ({b.get('risk_level', 'Unknown')})
+- Risk Factors: {', '.join(b.get('risk_factors', [])[:3])}
+- Key Clauses: {', '.join(b.get('key_clauses', [])[:3])}
+
+Provide:
+1. Which document is better and why (2-3 specific reasons)
+2. Key risks in each document that the user should watch out for
+3. A final recommendation in one sentence
+
+Be specific, practical, and use simple language a non-lawyer can understand."""
+
+    result = call_ollama_text(prompt)
+    return {"feedback": result}
 
 
 @app.get("/verify/")
